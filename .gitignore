@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Kết quả
+results/
+
+# Jupyter (Kaggle dùng notebook)
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
