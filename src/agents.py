@@ -68,18 +68,35 @@ class MCAgent:
 
     # ── Sinh episode ─────────────────────────────────────────────────────────
 
+    def _get_behaviour_prob(self, state: tuple, action_idx: int) -> float:
+        """
+        Xác suất behaviour policy chọn action_idx tại state.
+        Gọi NGAY LÚC SINH DATA khi Q còn đúng — không gọi lại trong _update().
+        Base class: epsilon-greedy behaviour.
+        OffPolicyAgent override cho uniform random.
+        """
+        _, _, vr, vc = state
+        va   = valid_actions(vr, vc)
+        best = self.greedy_action(state)
+        if action_idx == best:
+            return 1 - self.epsilon + self.epsilon / len(va)
+        return self.epsilon / len(va)
+
     def generate_episode(self, track, use_noise: bool = True) -> list:
         """
-        Chạy 1 episode, trả về list các (state, action_idx, reward).
+        Chạy 1 episode.
+        Trả về list các (state, action_idx, reward, b_prob).
+        b_prob lưu ngay lúc sinh data — tránh tính lại sau khi Q thay đổi.
         """
         trajectory = []
         state = track.reset()
 
         for _ in range(500):
             action_idx = self._select_action(state)
+            b_prob     = self._get_behaviour_prob(state, action_idx)
             action     = ACTIONS[action_idx]
             next_state, reward, done, _ = track.step(state, action, use_noise)
-            trajectory.append((state, action_idx, reward))
+            trajectory.append((state, action_idx, reward, b_prob))
             if done:
                 break
             state = next_state
@@ -112,21 +129,20 @@ class OnPolicyAgent(MCAgent):
     """
 
     def _update(self, trajectory: list):
-        # Tính G cho từng bước trước (duyệt xuôi)
+        # Tính G cho từng bước (duyệt ngược)
         T = len(trajectory)
         G = 0.0
         returns = []
-        for _, _, reward in reversed(trajectory):
+        for _, _, reward, _ in reversed(trajectory):
             G = self.gamma * G + reward
             returns.append(G)
         returns.reverse()  # returns[t] = G từ bước t trở đi
 
         visited = set()
-        for t, (state, action_idx, _) in enumerate(trajectory):
+        for t, (state, action_idx, _, _) in enumerate(trajectory):
             if (state, action_idx) not in visited:  # first-visit
                 visited.add((state, action_idx))
                 self.C[state][action_idx] += 1
-                # Incremental mean: Q = Q + (G - Q) / count
                 self.Q[state][action_idx] += (
                     (returns[t] - self.Q[state][action_idx])
                     / self.C[state][action_idx]
@@ -153,27 +169,20 @@ class OffPolicyAgent(MCAgent):
             return self.epsilon_greedy(state)
         return self.random_action(state)
 
-    def _behaviour_prob(self, state: tuple, action_idx: int) -> float:
-        """Xác suất của behaviour policy chọn action này."""
+    def _get_behaviour_prob(self, state: tuple, action_idx: int) -> float:
+        """
+        Override: tính đúng theo loại behaviour policy.
+        Gọi ngay lúc sinh data trong generate_episode() — Q còn đúng.
+        """
         _, _, vr, vc = state
         va = valid_actions(vr, vc)
         if self.behaviour == 'epsilon':
             best = self.greedy_action(state)
             if action_idx == best:
                 return 1 - self.epsilon + self.epsilon / len(va)
-            else:
-                return self.epsilon / len(va)
-        return 1.0 / len(va)  # uniform random
-
-    def _target_prob(self, state: tuple, action_idx: int,
-                     greedy_snapshot: dict) -> float:
-        """
-        Xác suất của target policy (greedy) chọn action này.
-        Dùng greedy_snapshot thay vì gọi greedy_action() trực tiếp
-        để tránh bị ảnh hưởng bởi các update Q giữa chừng.
-        """
-        best = greedy_snapshot.get(state, self.greedy_action(state))
-        return 1.0 if action_idx == best else 0.0
+            return self.epsilon / len(va)
+        # uniform random
+        return 1.0 / len(va)
 
 
 # ── Off-policy WIS ────────────────────────────────────────────────────────────
@@ -186,16 +195,15 @@ class WISAgent(OffPolicyAgent):
 
     def _update(self, trajectory: list):
         # Snapshot greedy action TRƯỚC khi update Q
-        # → tránh target policy bị thay đổi giữa chừng
         greedy_snapshot = {
             state: self.greedy_action(state)
-            for state, _, _ in trajectory
+            for state, _, _, _ in trajectory
         }
 
         G = 0.0
         W = 1.0
 
-        for state, action_idx, reward in reversed(trajectory):
+        for state, action_idx, reward, b_prob in reversed(trajectory):
             G = self.gamma * G + reward
 
             # Weighted IS update
@@ -208,8 +216,8 @@ class WISAgent(OffPolicyAgent):
             if action_idx != greedy_snapshot[state]:
                 break
 
-            b_prob = self._behaviour_prob(state, action_idx)
-            W *= 1.0 / b_prob  # target prob = 1.0 nên chỉ chia b_prob
+            # b_prob đã lưu từ lúc sinh data — không tính lại
+            W *= 1.0 / b_prob
 
             if W > 1e6:  # tránh W bùng nổ
                 break
@@ -227,16 +235,16 @@ class OISAgent(OffPolicyAgent):
         # Snapshot greedy action TRƯỚC khi update Q
         greedy_snapshot = {
             state: self.greedy_action(state)
-            for state, _, _ in trajectory
+            for state, _, _, _ in trajectory
         }
 
         G = 0.0
         W = 1.0
 
-        for state, action_idx, reward in reversed(trajectory):
+        for state, action_idx, reward, b_prob in reversed(trajectory):
             G = self.gamma * G + reward
 
-            # OIS: incremental mean đơn giản, nhân G với W
+            # OIS: incremental mean của W*G
             self.C[state][action_idx] += 1
             self.Q[state][action_idx] += (
                 (W * G - self.Q[state][action_idx])
@@ -246,7 +254,7 @@ class OISAgent(OffPolicyAgent):
             if action_idx != greedy_snapshot[state]:
                 break
 
-            b_prob = self._behaviour_prob(state, action_idx)
+            # b_prob đã lưu từ lúc sinh data — không tính lại
             W *= 1.0 / b_prob
 
             if W > 1e6:
@@ -259,15 +267,14 @@ class PerDecisionAgent(OffPolicyAgent):
     """
     Per-decision Importance Sampling.
     Áp dụng IS ratio độc lập từng bước thay vì cả episode.
-    Fix: cộng reward TRƯỚC khi nhân rho cho bước tiếp theo
-    → tránh rho=0 làm mất toàn bộ contribution của reward hiện tại.
+    Cộng reward TRƯỚC khi nhân rho → tránh mất contribution khi rho=0.
     """
 
     def _update(self, trajectory: list):
         # Snapshot greedy action TRƯỚC khi update Q
         greedy_snapshot = {
             state: self.greedy_action(state)
-            for state, _, _ in trajectory
+            for state, _, _, _ in trajectory
         }
 
         T = len(trajectory)
@@ -277,21 +284,20 @@ class PerDecisionAgent(OffPolicyAgent):
             rho = 1.0
 
             for k in range(t, T):
-                state_k, action_k, reward_k = trajectory[k]
+                state_k, action_k, reward_k, b_prob_k = trajectory[k]
 
-                # Cộng reward TRƯỚC — rho hiện tại áp cho reward bước k
+                # Cộng reward TRƯỚC với rho hiện tại
                 G += (self.gamma ** (k - t)) * rho * reward_k
 
-                # Sau đó mới nhân rho cho bước tiếp theo
-                best_k = greedy_snapshot.get(state_k, self.greedy_action(state_k))
+                # Tính rho cho bước tiếp theo
+                best_k = greedy_snapshot[state_k]
                 t_prob = 1.0 if action_k == best_k else 0.0
-                b_prob = self._behaviour_prob(state_k, action_k)
-                rho   *= t_prob / b_prob
+                rho   *= t_prob / b_prob_k  # b_prob đã lưu từ sinh data
 
-                if rho < 1e-10:  # rho = 0 → các bước sau không đóng góp
+                if rho < 1e-10:
                     break
 
-            state, action_idx, _ = trajectory[t]
+            state, action_idx, _, _ = trajectory[t]
             self.C[state][action_idx] += 1
             self.Q[state][action_idx] += (
                 (G - self.Q[state][action_idx])
