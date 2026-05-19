@@ -54,6 +54,7 @@ def train(agent, track, n_episodes: int = EPISODES,
         "episode_lengths": episode_lengths,
         "rewards":         rewards,
         "success_rates":   success_rates,
+        'agent': agent
     }
 
 
